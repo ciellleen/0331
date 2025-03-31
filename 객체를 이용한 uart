@@ -1,0 +1,175 @@
+# C코드
+
+```jsx
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <termios.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdexcept>
+
+class UART {
+private:
+    static const size_t BUFFER_SIZE = 7;
+    int uart_fd;
+    pthread_t read_thread;
+    unsigned char read_buf[BUFFER_SIZE];
+    volatile bool running;
+    const char* serial_device;
+    speed_t baudrate;
+    pthread_mutex_t mutex;
+
+    static uint16_t CRC16_MODBUS(const unsigned char* data, size_t length) {
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < length; i++) {
+            crc ^= static_cast<uint16_t>(data[i]);
+            for (int j = 0; j < 8; j++) {
+                crc = (crc & 0x0001) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+            }
+        }
+        return crc;
+    }
+
+    static void* readThreadWrapper(void* arg) {
+        UART* uart = static_cast<UART*>(arg);
+        return uart->readThreadFunction();
+    }
+
+    void* readThreadFunction() {
+        unsigned char insert_buf;
+        while (running) {
+            int num_bytes = read(uart_fd, &insert_buf, 1);
+            if (num_bytes > 0) {
+                pthread_mutex_lock(&mutex);
+                memmove(read_buf, read_buf + 1, BUFFER_SIZE - 1);
+                read_buf[BUFFER_SIZE - 1] = insert_buf;
+                unsigned char temp_buf[BUFFER_SIZE];
+                memcpy(temp_buf, read_buf, BUFFER_SIZE);
+                pthread_mutex_unlock(&mutex);
+                parseMotorCommand(temp_buf, BUFFER_SIZE);
+            }
+            else if (num_bytes < 0 && errno != EAGAIN) {
+                usleep(1000);
+            }
+            usleep(100);
+        }
+        return nullptr;
+    }
+
+public:
+    UART(const char* device = "/dev/ttyS0", speed_t baud = B115200) 
+        : uart_fd(-1), running(false), serial_device(device), baudrate(baud) {
+        if (pthread_mutex_init(&mutex, nullptr) != 0) {
+            throw std::runtime_error("Mutex initialization failed");
+        }
+        memset(read_buf, 0, BUFFER_SIZE);
+    }
+
+    ~UART() {
+        close();
+        pthread_mutex_destroy(&mutex);
+    }
+
+    bool init() {
+        uart_fd = open(serial_device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (uart_fd < 0) {
+            return false;
+        }
+        struct termios tty;
+        memset(&tty, 0, sizeof(tty));
+        if (tcgetattr(uart_fd, &tty) != 0) {
+            ::close(uart_fd);
+            uart_fd = -1;
+            return false;
+        }
+        tty.c_cflag = CS8 | CREAD | CLOCAL;
+        tty.c_lflag = 0;
+        tty.c_iflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cc[VTIME] = 1;
+        tty.c_cc[VMIN] = 0;
+        cfsetispeed(&tty, baudrate);
+        cfsetospeed(&tty, baudrate);
+        if (tcsetattr(uart_fd, TCSANOW, &tty) != 0) {
+            ::close(uart_fd);
+            uart_fd = -1;
+            return false;
+        }
+        tcflush(uart_fd, TCIOFLUSH);
+        return true;
+    }
+
+    bool startReadThread() {
+        if (uart_fd < 0) {
+            return false;
+        }
+        running = true;
+        int ret = pthread_create(&read_thread, nullptr, readThreadWrapper, this);
+        if (ret != 0) {
+            running = false;
+            return false;
+        }
+        pthread_detach(read_thread);
+        return true;
+    }
+
+    bool parseMotorCommand(const unsigned char* data, size_t data_length) {
+        if (data_length < BUFFER_SIZE) return false;
+        if (data[0] == '#' && data[1] == 'S' && data[4] == '*') {
+            uint16_t receivedCRC = (data[6] << 8) | data[5];
+            uint16_t calculatedCRC = CRC16_MODBUS(data, 5);
+            if (receivedCRC == calculatedCRC) {
+                uint16_t motor_speed = (data[2] << 8) | data[3];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void close() {
+        running = false;
+        if (uart_fd >= 0) {
+            tcflush(uart_fd, TCIOFLUSH);
+            ::close(uart_fd);
+            uart_fd = -1;
+        }
+    }
+};
+
+volatile sig_atomic_t keep_running = 1;
+
+void signal_handler(int sig) {
+    keep_running = 0;
+}
+
+int main() {
+    signal(SIGINT, signal_handler);
+    UART uart1("/dev/ttyS0", B115200);
+    if (!uart1.init()) {
+        return -1;
+    }
+    if (!uart1.startReadThread()) {
+        return -1;
+    }
+    UART uart2("/dev/ttyUSB0", B115200);
+    if (!uart2.init()) {
+        return -1;
+    }
+    if (!uart2.startReadThread()) {
+        return -1;
+    }
+    while (keep_running) {
+        usleep(10000);
+    }
+    uart1.close();
+    uart2.close();
+    return 0;
+}
+
+```
+
+# py 코드
